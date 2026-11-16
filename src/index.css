@@ -1,0 +1,768 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+
+const markerDefaults = {
+  normalCell: { label: '正常細胞', color: '#ffffff', stroke: '#0f172a', textColor: '#111827' },
+  abnormalCell: { label: '異常細胞', color: '#ef4444', stroke: '#7f1d1d', textColor: '#ffffff' },
+  structure: { label: '異常構造', color: 'rgba(239, 68, 68, 0.2)', stroke: '#dc2626' },
+  exclude: { label: '除外領域', color: 'rgba(59,130,246,0.18)', stroke: '#2563eb' },
+};
+
+const initialProject = {
+  categories: [
+    {
+      id: 'cat-1',
+      name: 'コントロール',
+      experiments: [
+        {
+          id: 'exp-1',
+          name: '1回目 (2026-11-15)',
+          images: [
+            {
+              id: 'img-1',
+              name: 'sample-01',
+              imageData: '',
+              annotations: [],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+const dbName = 'cell-count-db';
+const dbVersion = 1;
+
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(dbName, dbVersion);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains('project')) {
+        db.createObjectStore('project');
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveProjectToIndexedDb(project) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('project', 'readwrite');
+    const store = tx.objectStore('project');
+    const request = store.put(project, 'current');
+    request.onsuccess = () => resolve(true);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function loadProjectFromIndexedDb() {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('project', 'readonly');
+    const store = tx.objectStore('project');
+    const request = store.get('current');
+    request.onsuccess = () => resolve(request.result || initialProject);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getDistance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function formatCount(value) {
+  return Number.isFinite(value) ? value.toFixed(1) : '0';
+}
+
+function calculatePolygonArea(points) {
+  if (points.length < 3) return 0;
+  let area = 0;
+  for (let i = 0; i < points.length; i += 1) {
+    const p1 = points[i];
+    const p2 = points[(i + 1) % points.length];
+    area += p1.x * p2.y - p2.x * p1.y;
+  }
+  return Math.abs(area) / 2;
+}
+
+function areaFromAnnotations(annotations) {
+  const excludeAreas = annotations
+    .filter((a) => a.type === 'exclude')
+    .map((a) => calculatePolygonArea(a.points || []));
+
+  const total = excludeAreas.reduce((sum, area) => sum + area, 0);
+  return total;
+}
+
+function App() {
+  const [project, setProject] = useState(initialProject);
+  const [selectedCategoryId, setSelectedCategoryId] = useState('cat-1');
+  const [selectedExperimentId, setSelectedExperimentId] = useState('exp-1');
+  const [selectedImageId, setSelectedImageId] = useState('img-1');
+  const [tool, setTool] = useState('normalCell');
+  const [markerConfig, setMarkerConfig] = useState(markerDefaults);
+  const [dragState, setDragState] = useState(null);
+  const [showOriginal, setShowOriginal] = useState(false);
+  const svgRef = useRef(null);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const saved = await loadProjectFromIndexedDb();
+        if (saved) {
+          setProject(saved);
+          const firstCategory = saved.categories?.[0];
+          const firstExperiment = firstCategory?.experiments?.[0];
+          const firstImage = firstExperiment?.images?.[0];
+          setSelectedCategoryId(firstCategory?.id || 'cat-1');
+          setSelectedExperimentId(firstExperiment?.id || 'exp-1');
+          setSelectedImageId(firstImage?.id || 'img-1');
+        }
+      } catch (error) {
+        console.error('IndexedDB loaded failed', error);
+      }
+    };
+    load();
+  }, []);
+
+  useEffect(() => {
+    saveProjectToIndexedDb(project).catch((error) => {
+      console.error('IndexedDB save error', error);
+    });
+  }, [project]);
+
+  const selectedCategory =
+    project.categories.find((category) => category.id === selectedCategoryId) || project.categories[0];
+
+  const selectedExperiment =
+    selectedCategory?.experiments.find((experiment) => experiment.id === selectedExperimentId) ||
+    selectedCategory?.experiments[0];
+
+  const currentImage =
+    selectedExperiment?.images.find((image) => image.id === selectedImageId) || selectedExperiment?.images[0];
+
+  const imageSummary = useMemo(() => {
+    if (!currentImage) return { normal: 0, abnormal: 0, structures: 0, area: 0, density: 0 };
+
+    const normal = currentImage.annotations.filter((a) => a.type === 'normalCell').length;
+    const abnormal = currentImage.annotations.filter((a) => a.type === 'abnormalCell').length;
+    const structures = currentImage.annotations.filter((a) => a.type === 'structure').length;
+    const excludedArea = areaFromAnnotations(currentImage.annotations);
+    const totalCells = normal + abnormal;
+    const density = totalCells > 0 ? totalCells / Math.max(excludedArea, 1) : 0;
+
+    return {
+      normal,
+      abnormal,
+      structures,
+      area: excludedArea,
+      density,
+    };
+  }, [currentImage]);
+
+  const annotationCount = currentImage?.annotations.length || 0;
+
+  const updateCurrentImage = (nextImage) => {
+    setProject((previous) => {
+      const nextProject = structuredClone(previous);
+      const category = nextProject.categories.find((item) => item.id === selectedCategoryId);
+      const experiment = category?.experiments.find((item) => item.id === selectedExperimentId);
+      const imageIndex = experiment?.images.findIndex((item) => item.id === selectedImageId);
+      if (experiment && imageIndex !== undefined && imageIndex >= 0) {
+        experiment.images[imageIndex] = nextImage;
+      }
+      return nextProject;
+    });
+  };
+
+  const handleImageUpload = (event) => {
+    const file = event.target.files?.[0];
+    if (!file || !currentImage) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const nextImage = { ...currentImage, imageData: String(reader.result) };
+      updateCurrentImage(nextImage);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const addCategory = () => {
+    const newCategory = {
+      id: `cat-${Date.now()}`,
+      name: `カテゴリー ${project.categories.length + 1}`,
+      experiments: [
+        {
+          id: `exp-${Date.now()}`,
+          name: '実験回 1',
+          images: [
+            {
+              id: `img-${Date.now()}`,
+              name: '新��画像',
+              imageData: '',
+              annotations: [],
+            },
+          ],
+        },
+      ],
+    };
+    setProject((previous) => ({ ...previous, categories: [...previous.categories, newCategory] }));
+    setSelectedCategoryId(newCategory.id);
+    setSelectedExperimentId(newCategory.experiments[0].id);
+    setSelectedImageId(newCategory.experiments[0].images[0].id);
+  };
+
+  const addExperiment = () => {
+    setProject((previous) => {
+      const nextProject = structuredClone(previous);
+      const category = nextProject.categories.find((item) => item.id === selectedCategoryId);
+      if (!category) return previous;
+      const newExperiment = {
+        id: `exp-${Date.now()}`,
+        name: `実験回 ${category.experiments.length + 1}`,
+        images: [
+          {
+            id: `img-${Date.now()}`,
+            name: '新規画像',
+            imageData: '',
+            annotations: [],
+          },
+        ],
+      };
+      category.experiments.push(newExperiment);
+      return nextProject;
+    });
+    const category = selectedCategory;
+    const newExperimentId = category?.experiments[category.experiments.length - 1]?.id;
+    if (newExperimentId) {
+      setSelectedExperimentId(newExperimentId);
+      const imageId = category.experiments.at(-1)?.images[0]?.id;
+      if (imageId) setSelectedImageId(imageId);
+    }
+  };
+
+  const addImage = () => {
+    setProject((previous) => {
+      const nextProject = structuredClone(previous);
+      const category = nextProject.categories.find((item) => item.id === selectedCategoryId);
+      const experiment = category?.experiments.find((item) => item.id === selectedExperimentId);
+      if (!experiment) return previous;
+      const newImage = {
+        id: `img-${Date.now()}`,
+        name: `画像 ${experiment.images.length + 1}`,
+        imageData: '',
+        annotations: [],
+      };
+      experiment.images.push(newImage);
+      return nextProject;
+    });
+    const experiment = selectedExperiment;
+    const newImageId = experiment?.images[experiment.images.length - 1]?.id;
+    if (newImageId) setSelectedImageId(newImageId);
+  };
+
+  const getCoordsFromClientEvent = (event) => {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    const rect = svg.getBoundingClientRect();
+    const x = clamp(((event.clientX - rect.left) / rect.width) * 100, 0, 100);
+    const y = clamp(((event.clientY - rect.top) / rect.height) * 100, 0, 100);
+    return { x, y };
+  };
+
+  const removeAnnotationByClick = (event) => {
+    const coords = getCoordsFromClientEvent(event);
+    if (!currentImage) return;
+    const nearest = currentImage.annotations
+      .map((annotation) => {
+        if (annotation.type === 'normalCell' || annotation.type === 'abnormalCell') {
+          const distance = getDistance(coords, annotation);
+          return { annotation, distance };
+        }
+        if (annotation.type === 'structure') {
+          const distance = getDistance(coords, { x: annotation.x, y: annotation.y });
+          return { annotation, distance: distance - annotation.radius * 0.8 };
+        }
+        return null;
+      })
+      .filter(Boolean)
+      .sort((a, b) => a.distance - b.distance)[0];
+
+    if (!nearest || nearest.distance > 7) return;
+
+    const updated = currentImage.annotations.filter((item) => item.id !== nearest.annotation.id);
+    updateCurrentImage({ ...currentImage, annotations: updated });
+  };
+
+  const handlePointerDown = (event) => {
+    if (!currentImage) return;
+    const coords = getCoordsFromClientEvent(event);
+
+    if (tool === 'erase') {
+      removeAnnotationByClick(event);
+      return;
+    }
+
+    if (tool === 'normalCell' || tool === 'abnormalCell') {
+      const nextAnnotation = {
+        id: `a-${Date.now()}`,
+        type: tool,
+        x: coords.x,
+        y: coords.y,
+        label: markerConfig[tool].label,
+      };
+      const updated = [...currentImage.annotations, nextAnnotation];
+      updateCurrentImage({ ...currentImage, annotations: updated });
+      return;
+    }
+
+    if (tool === 'structure') {
+      setDragState({
+        type: 'structure',
+        start: coords,
+        current: coords,
+      });
+      return;
+    }
+
+    if (tool === 'exclude') {
+      setDragState({
+        type: 'exclude',
+        points: [coords],
+      });
+    }
+  };
+
+  const handlePointerMove = (event) => {
+    if (!dragState) return;
+    const coords = getCoordsFromClientEvent(event);
+
+    if (dragState.type === 'structure') {
+      setDragState((previous) => previous ? { ...previous, current: coords } : previous);
+      return;
+    }
+
+    if (dragState.type === 'exclude') {
+      const last = dragState.points[dragState.points.length - 1];
+      if (!last || getDistance(last, coords) > 1.6) {
+        setDragState((previous) => previous ? { ...previous, points: [...previous.points, coords] } : previous);
+      }
+    }
+  };
+
+  const finalizeDrag = () => {
+    if (!dragState || !currentImage) return;
+
+    if (dragState.type === 'structure') {
+      const radius = Math.min(60, Math.max(6, getDistance(dragState.start, dragState.current) * 1.4));
+      const nextAnnotation = {
+        id: `a-${Date.now()}`,
+        type: 'structure',
+        x: dragState.start.x,
+        y: dragState.start.y,
+        radius,
+        label: markerConfig.structure.label,
+      };
+      const updated = [...currentImage.annotations, nextAnnotation];
+      updateCurrentImage({ ...currentImage, annotations: updated });
+    }
+
+    if (dragState.type === 'exclude') {
+      if (dragState.points.length > 2) {
+        const nextAnnotation = {
+          id: `a-${Date.now()}`,
+          type: 'exclude',
+          points: dragState.points,
+          label: markerConfig.exclude.label,
+        };
+        const updated = [...currentImage.annotations, nextAnnotation];
+        updateCurrentImage({ ...currentImage, annotations: updated });
+      }
+    }
+
+    setDragState(null);
+  };
+
+  const exportCsv = () => {
+    if (!currentImage) return;
+    const rows = [
+      ['measurement', 'value'],
+      ['normalCellCount', imageSummary.normal],
+      ['abnormalCellCount', imageSummary.abnormal],
+      ['structureCount', imageSummary.structures],
+      ['excludedArea', imageSummary.area],
+      ['density', imageSummary.density],
+    ];
+    const csv = rows.map((row) => row.join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${currentImage.name}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportJson = () => {
+    if (!project) return;
+    const blob = new Blob([JSON.stringify(project, null, 2)], {
+      type: 'application/json;charset=utf-8;',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'cell-count-project.json';
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportPng = () => {
+    if (!currentImage || !svgRef.current) return;
+
+    const serializer = new XMLSerializer();
+    const svgMarkup = serializer.serializeToString(svgRef.current);
+    const svgBlob = new Blob([svgMarkup], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+    const img = new Image();
+
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 1200;
+      canvas.height = 760;
+      const context = canvas.getContext('2d');
+      context.fillStyle = '#ffffff';
+      context.fillRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const pngUrl = canvas.toDataURL('image/png');
+      const link = document.createElement('a');
+      link.href = pngUrl;
+      link.download = `${currentImage.name}.png`;
+      link.click();
+      URL.revokeObjectURL(url);
+    };
+
+    img.src = url;
+  };
+
+  const renderAnnotations = () => {
+    if (!currentImage) return null;
+    const visible = showOriginal ? [] : currentImage.annotations;
+
+    return visible.map((annotation) => {
+      if (annotation.type === 'normalCell' || annotation.type === 'abnormalCell') {
+        const isNormal = annotation.type === 'normalCell';
+        const config = isNormal ? markerConfig.normalCell : markerConfig.abnormalCell;
+
+        return (
+          <g key={annotation.id}>
+            <circle
+              cx={`${annotation.x}%`}
+              cy={`${annotation.y}%`}
+              r="2.2%"
+              fill={config.color}
+              stroke={config.stroke}
+              strokeWidth="1.5"
+            />
+            <text
+              x={`${annotation.x}%`}
+              y={`${annotation.y + 1.2}%`}
+              fill={config.textColor || '#111827'}
+              fontSize="3.2"
+              textAnchor="middle"
+              fontWeight="700"
+            >
+              {annotation.label || (isNormal ? 'N' : 'A')}
+            </text>
+          </g>
+        );
+      }
+
+      if (annotation.type === 'structure') {
+        return (
+          <circle
+            key={annotation.id}
+            cx={`${annotation.x}%`}
+            cy={`${annotation.y}%`}
+            r={`${Math.max(2, annotation.radius || 10)}%`}
+            fill={markerConfig.structure.color}
+            stroke={markerConfig.structure.stroke}
+            strokeWidth="1.5"
+            fillOpacity="0.2"
+          />
+        );
+      }
+
+      if (annotation.type === 'exclude' && annotation.points?.length) {
+        const d = annotation.points
+          .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
+          .join(' ');
+
+        return (
+          <path
+            key={annotation.id}
+            d={`${d} Z`}
+            fill={markerConfig.exclude.color}
+            stroke={markerConfig.exclude.stroke}
+            strokeWidth="1.2"
+            fillOpacity="0.35"
+          />
+        );
+      }
+
+      return null;
+    });
+  };
+
+  const renderDragPreview = () => {
+    if (!dragState || !currentImage) return null;
+
+    if (dragState.type === 'structure') {
+      const radius = Math.min(60, Math.max(6, getDistance(dragState.start, dragState.current) * 1.4));
+      return (
+        <circle
+          cx={`${dragState.start.x}%`}
+          cy={`${dragState.start.y}%`}
+          r={`${radius}%`}
+          fill={markerConfig.structure.color}
+          stroke={markerConfig.structure.stroke}
+          strokeWidth="1.5"
+          fillOpacity="0.2"
+        />
+      );
+    }
+
+    if (dragState.type === 'exclude' && dragState.points.length > 1) {
+      const d = dragState.points
+        .map((point, index) => `${index === 0 ? 'M' : 'L'} ${point.x} ${point.y}`)
+        .join(' ');
+      return (
+        <path
+          d={`${d} Z`}
+          fill={markerConfig.exclude.color}
+          stroke={markerConfig.exclude.stroke}
+          strokeWidth="1.4"
+          fillOpacity="0.35"
+        />
+      );
+    }
+
+    return null;
+  };
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="panel-block">
+          <h2>画像管理</h2>
+          <button className="primary" onClick={addCategory}>＋ カテゴリー追加</button>
+          <button onClick={addExperiment}>＋ 実験回追加</button>
+          <button onClick={addImage}>＋ 画像追加</button>
+        </div>
+
+        <div className="panel-block">
+          <h3>カテゴリー</h3>
+          <div className="list-stack">
+            {project.categories.map((category) => (
+              <button
+                key={category.id}
+                className={selectedCategoryId === category.id ? 'list-item active' : 'list-item'}
+                onClick={() => {
+                  setSelectedCategoryId(category.id);
+                  const experiment = category.experiments[0];
+                  if (experiment) {
+                    setSelectedExperimentId(experiment.id);
+                    setSelectedImageId(experiment.images[0]?.id || '');
+                  }
+                }}
+              >
+                {category.name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel-block">
+          <h3>実験回</h3>
+          <div className="list-stack">
+            {selectedCategory?.experiments.map((experiment) => (
+              <button
+                key={experiment.id}
+                className={selectedExperimentId === experiment.id ? 'list-item active' : 'list-item'}
+                onClick={() => {
+                  setSelectedExperimentId(experiment.id);
+                  setSelectedImageId(experiment.images[0]?.id || '');
+                }}
+              >
+                {experiment.name}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel-block">
+          <h3>画像</h3>
+          <div className="list-stack">
+            {selectedExperiment?.images.map((image) => (
+              <button
+                key={image.id}
+                className={selectedImageId === image.id ? 'list-item active' : 'list-item'}
+                onClick={() => setSelectedImageId(image.id)}
+              >
+                {image.name}
+              </button>
+            ))}
+          </div>
+        </div>
+      </aside>
+
+      <main className="workspace">
+        <header className="topbar">
+          <div className="tool-header">
+            <button className={tool === 'normalCell' ? 'tool active' : 'tool'} onClick={() => setTool('normalCell')}>
+              正常細胞
+            </button>
+            <button className={tool === 'abnormalCell' ? 'tool active' : 'tool'} onClick={() => setTool('abnormalCell')}>
+              異常細胞
+            </button>
+            <button className={tool === 'structure' ? 'tool active' : 'tool'} onClick={() => setTool('structure')}>
+              異常構造
+            </button>
+            <button className={tool === 'exclude' ? 'tool active' : 'tool'} onClick={() => setTool('exclude')}>
+              除外領域
+            </button>
+            <button className={tool === 'erase' ? 'tool active erase' : 'tool erase'} onClick={() => setTool('erase')}>
+              消しゴム
+            </button>
+          </div>
+
+          <div className="export-box">
+            <button onClick={() => setShowOriginal((previous) => !previous)}>
+              {showOriginal ? 'マーカー表示' : '元画像確認'}
+            </button>
+            <button onClick={exportCsv}>CSV</button>
+            <button onClick={exportJson}>JSON</button>
+            <button onClick={exportPng}>PNG</button>
+          </div>
+        </header>
+
+        <section className="canvas-panel">
+          <div className="image-title-row">
+            <input
+              value={currentImage?.name || ''}
+              onChange={(event) => {
+                const nextImage = { ...currentImage, name: event.target.value };
+                updateCurrentImage(nextImage);
+              }}
+            />
+            <label className="upload-box">
+              画像を読み込む
+              <input type="file" accept="image/*" onChange={handleImageUpload} />
+            </label>
+          </div>
+
+          <div className="image-stage">
+            {currentImage?.imageData ? (
+              <svg
+                ref={svgRef}
+                viewBox="0 0 100 100"
+                preserveAspectRatio="xMidYMid meet"
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={finalizeDrag}
+                onPointerLeave={finalizeDrag}
+              >
+                <image
+                  href={currentImage.imageData}
+                  x="0"
+                  y="0"
+                  width="100"
+                  height="100"
+                  preserveAspectRatio="xMidYMid meet"
+                />
+                {!showOriginal && renderAnnotations()}
+                {dragState && renderDragPreview()}
+              </svg>
+            ) : (
+              <div className="empty-stage">画像を読み込んで測定画面を開始してください</div>
+            )}
+          </div>
+        </section>
+
+        <aside className="summary-panel">
+          <div className="panel-block">
+            <h3>定量結果</h3>
+            <div className="stat-grid">
+              <div className="stat-box">
+                <span>正常細胞</span>
+                <strong>{imageSummary.normal}</strong>
+              </div>
+              <div className="stat-box">
+                <span>異常細胞</span>
+                <strong>{imageSummary.abnormal}</strong>
+              </div>
+              <div className="stat-box">
+                <span>異常構造</span>
+                <strong>{imageSummary.structures}</strong>
+              </div>
+              <div className="stat-box">
+                <span>有効面積</span>
+                <strong>{formatCount(imageSummary.area)}</strong>
+              </div>
+              <div className="stat-box">
+                <span>細胞密度</span>
+                <strong>{formatCount(imageSummary.density)}</strong>
+              </div>
+              <div className="stat-box">
+                <span>マーカー数</span>
+                <strong>{annotationCount}</strong>
+              </div>
+            </div>
+          </div>
+
+          <div className="panel-block">
+            <h3>マーカー設定</h3>
+            <div className="config-list">
+              {Object.entries(markerConfig).map(([key, value]) => (
+                <div key={key} className="config-item">
+                  <label>
+                    <span>{value.label}</span>
+                    <input
+                      type="text"
+                      value={value.label}
+                      onChange={(event) => {
+                        const next = { ...markerConfig, [key]: { ...value, label: event.target.value } };
+                        setMarkerConfig(next);
+                      }}
+                    />
+                  </label>
+                  <label className="swatch-box">
+                    <span>色</span>
+                    <input
+                      type="color"
+                      value={value.color.startsWith('#') ? value.color : '#ffffff'}
+                      onChange={(event) => {
+                        const next = { ...markerConfig, [key]: { ...value, color: event.target.value } };
+                        setMarkerConfig(next);
+                      }}
+                    />
+                  </label>
+                </div>
+              ))}
+            </div>
+          </div>
+        </aside>
+      </main>
+    </div>
+  );
+}
+
+export default App;
